@@ -1,12 +1,180 @@
 import tkinter as tk
 from tkinter import simpledialog, messagebox, scrolledtext, filedialog, ttk
+import sqlite3
+import hashlib
+import secrets
 from practice import CarPark
+
+# ============================================================================
+# DEFAULT ADMIN CREDENTIALS - USED ONLY ON FIRST RUN TO SEED USER TABLE
+# CHANGE THESE BEFORE FIRST RUN TO SET YOUR OWN DEFAULT ADMIN ACCOUNT.
+# ============================================================================
+DEFAULT_ADMIN_USERNAME = "admin"
+DEFAULT_ADMIN_PASSWORD = "admin"
+# ============================================================================
+
+
+def hash_password(password: str) -> str:
+    """Create a salted password hash using SHA-256."""
+    salt = secrets.token_hex(16)
+    hashed = hashlib.sha256(f"{salt}{password}".encode("utf-8")).hexdigest()
+    return f"{salt}${hashed}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify a password against the stored salted hash."""
+    if not stored_hash or "$" not in stored_hash:
+        return False
+    salt, hashed = stored_hash.split("$", 1)
+    candidate = hashlib.sha256(f"{salt}{password}".encode("utf-8")).hexdigest()
+    return secrets.compare_digest(candidate, hashed)
+
+
+class UserManager:
+    """Simple user manager that stores accounts inside the same SQLite DB."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._ensure_user_table()
+        self._ensure_default_admin()
+
+    def _connect(self):
+        return sqlite3.connect(self.db_path)
+
+    def _ensure_user_table(self):
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'user',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _ensure_default_admin(self):
+        if not self.get_user(DEFAULT_ADMIN_USERNAME):
+            self.create_user(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD, role="admin")
+
+    # ------------------------------------------------------------------ API --
+    def get_user(self, username: str):
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "SELECT username, password_hash, role FROM users WHERE username = ?",
+                (username,),
+            )
+            row = cur.fetchone()
+            if row:
+                return {"username": row[0], "password_hash": row[1], "role": row[2]}
+            return None
+        finally:
+            conn.close()
+
+    def list_users(self):
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "SELECT username, role, created_at FROM users ORDER BY created_at ASC"
+            )
+            return [
+                {"username": row[0], "role": row[1], "created_at": row[2]}
+                for row in cur.fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def create_user(self, username: str, password: str, role: str = "user"):
+        username = (username or "").strip()
+        if not username:
+            raise ValueError("Username cannot be empty.")
+        if not password:
+            raise ValueError("Password cannot be empty.")
+        role = (role or "user").lower()
+        if role not in ("user", "admin"):
+            raise ValueError("Role must be 'user' or 'admin'.")
+        if self.get_user(username):
+            raise ValueError("Username already exists.")
+
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
+                (username, hash_password(password), role),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def authenticate(self, username: str, password: str) -> bool:
+        user = self.get_user(username)
+        if not user:
+            return False
+        return verify_password(password, user["password_hash"])
+
+    def change_password(self, username: str, new_password: str):
+        if not new_password:
+            raise ValueError("Password cannot be empty.")
+        if not self.get_user(username):
+            raise ValueError("User does not exist.")
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE username = ?",
+                (hash_password(new_password), username),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def reset_password(self, target_username: str, new_password: str):
+        self.change_password(target_username, new_password)
+
+    def delete_user(self, target_username: str):
+        if not self.get_user(target_username):
+            raise ValueError("User does not exist.")
+        if self.is_last_admin(target_username):
+            raise ValueError("Cannot delete the last admin account.")
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM users WHERE username = ?", (target_username,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def is_admin(self, username: str) -> bool:
+        user = self.get_user(username)
+        return bool(user and user.get("role") == "admin")
+
+    def is_last_admin(self, username: str) -> bool:
+        user = self.get_user(username)
+        if not user or user.get("role") != "admin":
+            return False
+        conn = self._connect()
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+            count = cur.fetchone()[0]
+            return count == 1
+        finally:
+            conn.close()
 
 
 class CarParkGUI:
-    def __init__(self, root):
+    def __init__(self, root, user_manager: UserManager, current_user: str):
         self.root = root
-        root.title('Car Park Manager')
+        self.user_manager = user_manager
+        self.current_user = current_user
+        self.db_path = self.user_manager.db_path
+        root.title(f'Car Park Manager — Logged in as {self.current_user}')
+
+        # Build application menus (account management, admin tools)
+        self._build_menus()
 
         # Top frame: capacity
         top = tk.Frame(root)
@@ -79,7 +247,7 @@ class CarParkGUI:
 
         # initialize
         self.park = None
-        self.db_path = 'carpark.db'
+        # db_path is already set from user_manager.db_path above
         self.auto_load_on_startup()
 
         # keyboard shortcuts
@@ -100,6 +268,22 @@ class CarParkGUI:
         
         # auto-save on exit
         root.protocol('WM_DELETE_WINDOW', self.on_exit)
+
+    def _build_menus(self):
+        menubar = tk.Menu(self.root)
+
+        account_menu = tk.Menu(menubar, tearoff=0)
+        account_menu.add_command(label='Change Password', command=self.change_password_dialog)
+        account_menu.add_separator()
+        account_menu.add_command(label='Logout', command=self.logout)
+        menubar.add_cascade(label='Account', menu=account_menu)
+
+        if self.user_manager.is_admin(self.current_user):
+            admin_menu = tk.Menu(menubar, tearoff=0)
+            admin_menu.add_command(label='Manage Users', command=self.manage_users_dialog)
+            menubar.add_cascade(label='Admin', menu=admin_menu)
+
+        self.root.config(menu=menubar)
 
     def create_park(self):
         try:
@@ -888,6 +1072,185 @@ Generated: {datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')}
         tk.Button(btn_frame, text='Select', command=on_select).pack(side='right', padx=8)
         tk.Button(btn_frame, text='Close', command=dlg.destroy).pack(side='right')
 
+    # ------------------------------------------------------------------ User management
+    def change_password_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Change Password')
+        dlg.geometry('360x260')
+        dlg.resizable(False, False)
+
+        title = tk.Label(dlg, text=f'Change Password — {self.current_user}', font=('Arial', 12, 'bold'))
+        title.pack(pady=12)
+
+        cur_frame = tk.LabelFrame(dlg, text='Current Password', padx=12, pady=10)
+        cur_frame.pack(fill='x', padx=20, pady=6)
+        current_var = tk.StringVar()
+        current_entry = tk.Entry(cur_frame, textvariable=current_var, show='*', font=('Arial', 11))
+        current_entry.pack(fill='x')
+        current_entry.focus()
+
+        new_frame = tk.LabelFrame(dlg, text='New Password', padx=12, pady=10)
+        new_frame.pack(fill='x', padx=20, pady=6)
+        new_var = tk.StringVar()
+        new_entry = tk.Entry(new_frame, textvariable=new_var, show='*', font=('Arial', 11))
+        new_entry.pack(fill='x')
+
+        confirm_frame = tk.LabelFrame(dlg, text='Confirm New Password', padx=12, pady=10)
+        confirm_frame.pack(fill='x', padx=20, pady=6)
+        confirm_var = tk.StringVar()
+        confirm_entry = tk.Entry(confirm_frame, textvariable=confirm_var, show='*', font=('Arial', 11))
+        confirm_entry.pack(fill='x')
+
+        feedback = tk.Label(dlg, text='', fg='red')
+        feedback.pack()
+
+        def submit():
+            current_pw = current_var.get()
+            new_pw = new_var.get()
+            confirm_pw = confirm_var.get()
+
+            if not self.user_manager.authenticate(self.current_user, current_pw):
+                feedback.config(text='Current password is incorrect.')
+                current_var.set('')
+                current_entry.focus()
+                return
+            if not new_pw:
+                feedback.config(text='New password cannot be empty.')
+                return
+            if new_pw != confirm_pw:
+                feedback.config(text='Passwords do not match.')
+                confirm_var.set('')
+                confirm_entry.focus()
+                return
+            try:
+                self.user_manager.change_password(self.current_user, new_pw)
+                messagebox.showinfo('Success', 'Password updated successfully.')
+                dlg.destroy()
+            except ValueError as e:
+                feedback.config(text=str(e))
+
+        btn_frame = tk.Frame(dlg)
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text='Update', width=12, bg='#4CAF50', fg='white', command=submit).pack(side='left', padx=6)
+        tk.Button(btn_frame, text='Cancel', width=12, command=dlg.destroy).pack(side='left', padx=6)
+
+        def on_enter(event):
+            submit()
+
+        confirm_entry.bind('<Return>', on_enter)
+
+    def logout(self):
+        if messagebox.askyesno('Logout', 'Are you sure you want to logout?'):
+            self.on_exit()
+            run_gui(self.db_path)
+
+    def manage_users_dialog(self):
+        if not self.user_manager.is_admin(self.current_user):
+            messagebox.showerror('Access Denied', 'Only admins can manage users.')
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('User Management')
+        dlg.geometry('520x420')
+        dlg.resizable(False, False)
+
+        columns = ('username', 'role', 'created')
+        tree = ttk.Treeview(dlg, columns=columns, show='headings')
+        tree.heading('username', text='Username')
+        tree.heading('role', text='Role')
+        tree.heading('created', text='Created')
+        tree.column('username', width=140, anchor='w')
+        tree.column('role', width=80, anchor='center')
+        tree.column('created', width=220, anchor='w')
+
+        vsb = ttk.Scrollbar(dlg, orient='vertical', command=tree.yview)
+        tree.configure(yscroll=vsb.set)
+
+        tree.grid(row=0, column=0, sticky='nsew', padx=(10,0), pady=10)
+        vsb.grid(row=0, column=1, sticky='ns', pady=10, padx=(0,10))
+
+        dlg.grid_rowconfigure(0, weight=1)
+        dlg.grid_columnconfigure(0, weight=1)
+
+        def refresh_users():
+            for item in tree.get_children():
+                tree.delete(item)
+            for user in self.user_manager.list_users():
+                created_display = user.get('created_at', '') or ''
+                tree.insert('', 'end', values=(user['username'], user['role'], created_display))
+
+        refresh_users()
+
+        btn_frame = tk.Frame(dlg)
+        btn_frame.grid(row=1, column=0, columnspan=2, pady=(0, 12))
+
+        def add_user():
+            username = simpledialog.askstring('Add User', 'Enter username:', parent=dlg)
+            if not username:
+                return
+            password = simpledialog.askstring('Add User', 'Enter password:', show='*', parent=dlg)
+            if password is None:
+                return
+            confirm = simpledialog.askstring('Add User', 'Confirm password:', show='*', parent=dlg)
+            if confirm is None:
+                return
+            if password != confirm:
+                messagebox.showerror('Error', 'Passwords do not match.', parent=dlg)
+                return
+            role = simpledialog.askstring('Add User', "Role (admin/user):", initialvalue='user', parent=dlg)
+            if role is None:
+                role = 'user'
+            try:
+                self.user_manager.create_user(username.strip(), password, role.strip().lower())
+                messagebox.showinfo('Success', f'User "{username}" created.', parent=dlg)
+                refresh_users()
+            except ValueError as e:
+                messagebox.showerror('Error', str(e), parent=dlg)
+
+        def reset_password():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showwarning('Select User', 'Please select a user first.', parent=dlg)
+                return
+            username = tree.item(selection[0], 'values')[0]
+            new_pw = simpledialog.askstring('Reset Password', f'Enter new password for {username}:', show='*', parent=dlg)
+            if new_pw is None:
+                return
+            confirm = simpledialog.askstring('Reset Password', 'Confirm new password:', show='*', parent=dlg)
+            if confirm is None:
+                return
+            if new_pw != confirm:
+                messagebox.showerror('Error', 'Passwords do not match.', parent=dlg)
+                return
+            try:
+                self.user_manager.reset_password(username, new_pw)
+                messagebox.showinfo('Success', f'Password for "{username}" updated.', parent=dlg)
+            except ValueError as e:
+                messagebox.showerror('Error', str(e), parent=dlg)
+
+        def delete_user():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showwarning('Select User', 'Please select a user first.', parent=dlg)
+                return
+            username = tree.item(selection[0], 'values')[0]
+            if username == self.current_user:
+                messagebox.showerror('Error', 'You cannot delete the currently logged-in account.', parent=dlg)
+                return
+            if not messagebox.askyesno('Confirm Delete', f'Delete user "{username}"?', parent=dlg):
+                return
+            try:
+                self.user_manager.delete_user(username)
+                messagebox.showinfo('Deleted', f'User "{username}" deleted.', parent=dlg)
+                refresh_users()
+            except ValueError as e:
+                messagebox.showerror('Error', str(e), parent=dlg)
+
+        tk.Button(btn_frame, text='Add User', width=14, command=add_user).pack(side='left', padx=6)
+        tk.Button(btn_frame, text='Reset Password', width=14, command=reset_password).pack(side='left', padx=6)
+        tk.Button(btn_frame, text='Delete User', width=14, command=delete_user).pack(side='left', padx=6)
+        tk.Button(btn_frame, text='Close', width=10, command=dlg.destroy).pack(side='left', padx=12)
+
     def save_park(self):
         if not self.park:
             messagebox.showwarning('No park', 'Create a car park first')
@@ -952,10 +1315,141 @@ Generated: {datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')}
         self.root.destroy()
 
 
-def run_gui():
-    root = tk.Tk()
-    app = CarParkGUI(root)
-    root.mainloop()
+def show_login_dialog(user_manager: UserManager):
+    """Display login dialog and return the authenticated username or None."""
+    try:
+        login_root = tk.Tk()
+        login_root.title('Login - Car Park Manager')
+        login_root.geometry('400x250')
+        login_root.resizable(False, False)
+        
+        # Center the window
+        login_root.update_idletasks()
+        x = (login_root.winfo_screenwidth() // 2) - (400 // 2)
+        y = (login_root.winfo_screenheight() // 2) - (250 // 2)
+        login_root.geometry(f'400x250+{x}+{y}')
+        
+        # Result variable
+        login_result = {'user': None}
+    except Exception as e:
+        # If we can't create the login window, show error and return None
+        try:
+            error_root = tk.Tk()
+            error_root.withdraw()
+            messagebox.showerror('Error', f'Failed to create login window:\n{str(e)}')
+            error_root.destroy()
+        except:
+            pass
+        return None
+    
+    # Title
+    title = tk.Label(login_root, text='Car Park Manager Login', font=('Arial', 16, 'bold'))
+    title.pack(pady=20)
+    
+    # Username frame
+    username_frame = tk.LabelFrame(login_root, text='Username', font=('Arial', 10, 'bold'), padx=12, pady=10)
+    username_frame.pack(fill='x', padx=30, pady=10)
+    
+    username_var = tk.StringVar()
+    username_entry = tk.Entry(username_frame, textvariable=username_var, font=('Arial', 11), width=25)
+    username_entry.pack(fill='x')
+    username_entry.focus()
+    
+    # Password frame
+    password_frame = tk.LabelFrame(login_root, text='Password', font=('Arial', 10, 'bold'), padx=12, pady=10)
+    password_frame.pack(fill='x', padx=30, pady=10)
+    
+    password_var = tk.StringVar()
+    password_entry = tk.Entry(password_frame, textvariable=password_var, font=('Arial', 11), width=25, show='*')
+    password_entry.pack(fill='x')
+    
+    # Error label (initially hidden)
+    error_label = tk.Label(login_root, text='', font=('Arial', 9), fg='red')
+    error_label.pack(pady=5)
+    
+    def attempt_login():
+        username = username_var.get().strip()
+        password = password_var.get().strip()
+        if not username or not password:
+            error_label.config(text='Please enter both username and password.')
+            return
+        if user_manager.authenticate(username, password):
+            login_result['user'] = username
+            login_root.destroy()
+        else:
+            error_label.config(text='Invalid username or password!')
+            password_var.set('')
+            password_entry.focus()
+    
+    def on_enter(event):
+        attempt_login()
+    
+    # Bind Enter key to login
+    username_entry.bind('<Return>', lambda e: password_entry.focus())
+    password_entry.bind('<Return>', on_enter)
+    
+    # Buttons
+    btn_frame = tk.Frame(login_root)
+    btn_frame.pack(fill='x', padx=30, pady=15)
+    
+    tk.Button(btn_frame, text='Login', width=12, bg='#4CAF50', fg='white', 
+              font=('Arial', 10, 'bold'), command=attempt_login).pack(side='left', padx=5)
+    tk.Button(btn_frame, text='Cancel', width=12, bg='#f44336', fg='white', 
+              font=('Arial', 10), command=login_root.destroy).pack(side='left', padx=5)
+    
+    login_root.mainloop()
+    return login_result['user']
+
+
+def run_gui(db_path='carpark.db'):
+    import os
+    import sys
+    
+    # If running as executable, use the directory where the .exe is located
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        application_path = os.path.dirname(sys.executable)
+        db_path = os.path.join(application_path, 'carpark.db')
+    else:
+        # Running as script
+        if not os.path.isabs(db_path):
+            db_path = os.path.join(os.getcwd(), db_path)
+    
+    try:
+        user_manager = UserManager(db_path)
+    except Exception as e:
+        # Show error and exit if we can't initialize user manager
+        root = tk.Tk()
+        root.withdraw()  # Hide main window
+        messagebox.showerror('Initialization Error', 
+                           f'Failed to initialize user database:\n{str(e)}\n\nPlease check file permissions.')
+        root.destroy()
+        return
+    
+    # Show login dialog first
+    try:
+        username = show_login_dialog(user_manager)
+        if not username:
+            return
+    except Exception as e:
+        # Show error if login dialog fails
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror('Login Error', f'Failed to show login dialog:\n{str(e)}')
+        root.destroy()
+        return
+    
+    # Login successful, show main application
+    try:
+        root = tk.Tk()
+        app = CarParkGUI(root, user_manager=user_manager, current_user=username)
+        root.mainloop()
+    except Exception as e:
+        # Show error if main app fails
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror('Application Error', f'Failed to start application:\n{str(e)}')
+        root.destroy()
 
 
 if __name__ == '__main__':
