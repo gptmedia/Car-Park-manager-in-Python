@@ -305,5 +305,18 @@ def delete_user(username):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000, host="0.0.0.0")
+    # Optional SSL support. Set USE_SSL=1 to enable.
+    # If SSL_CERT and SSL_KEY are provided they will be used,
+    # otherwise Flask will use an adhoc/self-signed cert for development.
+    use_ssl = os.environ.get("USE_SSL", "").lower() in ("1", "true", "yes", "on")
+    if use_ssl:
+        cert = os.environ.get("SSL_CERT")
+        key = os.environ.get("SSL_KEY")
+        if cert and key:
+            ssl_ctx = (cert, key)
+        else:
+            ssl_ctx = "adhoc"
+        app.run(debug=True, port=5000, host="0.0.0.0", ssl_context=ssl_ctx)
+    else:
+        app.run(debug=True, port=5000, host="0.0.0.0")
 
